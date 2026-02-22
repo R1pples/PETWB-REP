@@ -6,7 +6,10 @@ Preprocessing steps include:
 * **Anonymization**: Removing patient identifiers from metadata.
 * **Facial stripping**: Removing facial features to ensure privacy.
 * **SUV calculation**: Computing Standardized Uptake Value (SUV) for PET images and align CT images to PET space.
-
+## To get started
+```bash
+git clone https://github.com/R1pples/PETWB-REP.git
+```
 ## Anonymization
 Patient identifiers and sensitive metadata were removed using the [RSNA DICOM Anonymizer (V18.0)](https://github.com/RSNA/Anonymizer) to remove the identifiers. The process follows standard de-identification protocols to ensure data privacy and compliance with ethical guidelines.
 ## Facial stripping
