@@ -1,7 +1,7 @@
 # <div align="center"><b> PETWB-REP </b></div>
 [**📕zenodo**](https://zenodo.org/records/16789748)
 
-This is the official repository for **PETWB-REP: A Dataset of Whole-body PET/CT Scans with Paired Radiology Reports**, in which we provide scripts for whole-body image processing.
+This is the official repository for **PETWB-REP: A Multi-Cancer Whole-Body FDG PET/CT Dataset with Corresponding Radiology Reports**, in which we provide scripts for whole-body image processing.
 Preprocessing steps include:
 * **Anonymization**: Removing patient identifiers from metadata.
 * **Facial stripping**: Removing facial features to ensure privacy.
