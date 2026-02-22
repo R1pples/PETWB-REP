@@ -1,0 +1,178 @@
+import argparse
+import os
+import subprocess
+import shutil
+import time
+import gc
+import logging
+from pathlib import Path
+import nibabel as nib
+import numpy as np
+from multiprocessing import Process, Queue
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Default nnU-Net Environment Configuration
+# These can be overridden by system environment variables
+os.environ.setdefault('nnUNet_results', './model')
+os.environ.setdefault('nnUNet_preprocessed', './model')
+os.environ.setdefault('nnUNet_raw', './model')
+
+def run_nnunet_inference(input_folder, output_folder, device_id, timeout=600):
+    """Executes nnU-Net prediction as a subprocess."""
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(device_id)
+    # Optimize CPU usage for parallel workers
+    env["OMP_NUM_THREADS"] = "1"
+    env["MKL_NUM_THREADS"] = "1"
+    
+    command = [
+        "nnUNetv2_predict",
+        "-i", str(input_folder),
+        "-o", str(output_folder),
+        "-d", "001",
+        "-c", "3d_fullres",
+        "-f", "all",
+        "-npp", "1",            
+        "--disable_tta",
+        "-device", "cuda"
+    ]
+    
+    try:
+        result = subprocess.run(
+            command, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.STDOUT, 
+            text=True, 
+            env=env,
+            timeout=timeout
+        )
+        
+        # Verify success by checking output files
+        if list(output_folder.glob("*.nii.gz")):
+            return True, "Success"
+            
+        if result.returncode != 0:
+            return False, result.stdout
+        return True, ""
+        
+    except subprocess.TimeoutExpired:
+        return False, "Process Timed Out"
+    except Exception as e:
+        return False, str(e)
+
+def worker_process(queue, output_root, crop_z, device_id, worker_id, xy_margin=50, max_retries=2):
+    """Consumer process: Handles cropping, inference, and mask restoration."""
+    while not queue.empty():
+        try:
+            f_path = queue.get_nowait()
+        except:
+            break
+
+        case_id = f_path.name.replace("_0000.nii.gz", "")
+        unique_id = f"gpu{device_id}_w{worker_id}_{case_id}"
+        temp_input = output_root / f"temp_in_{unique_id}"
+        temp_output = output_root / f"temp_out_{unique_id}"
+        
+        gc.collect()
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                # Setup temporary directories
+                for path in [temp_input, temp_output]:
+                    if path.exists(): shutil.rmtree(path)
+                    path.mkdir(parents=True, exist_ok=True)
+
+                logging.info(f"[GPU {device_id}] Processing: {case_id} (Attempt {attempt})")
+
+                # --- 1. Load and Crop (Optimized for performance) ---
+                orig_img = nib.load(f_path)
+                data = orig_img.get_fdata()
+                x_dim, y_dim, z_dim = data.shape
+                
+                # Z-axis: Keep top slices | XY-axis: Inset from boundaries
+                z_start = max(0, z_dim - crop_z)
+                x_start, x_end = (xy_margin, x_dim - xy_margin) if x_dim > (xy_margin * 2) else (0, x_dim)
+                y_start, y_end = (xy_margin, y_dim - xy_margin) if y_dim > (xy_margin * 2) else (0, y_dim)
+                
+                cropped_data = data[x_start:x_end, y_start:y_end, z_start:]
+                cropped_img = nib.Nifti1Image(cropped_data, orig_img.affine, orig_img.header)
+                nib.save(cropped_img, str(temp_input / f"{case_id}_0000.nii.gz"))
+
+                # --- 2. Inference ---
+                success, msg = run_nnunet_inference(temp_input, temp_output, device_id)
+                
+                # --- 3. Result Restoration ---
+                pred_file = temp_output / f"{case_id}.nii.gz"
+                if pred_file.exists():
+                    mask_crop = nib.load(pred_file).get_fdata()
+                    full_mask = np.zeros(data.shape, dtype=np.uint8)
+                    
+                    # Map cropped mask back to original coordinate space
+                    full_mask[x_start:x_end, y_start:y_end, z_start:] = mask_crop.astype(np.uint8)
+                    
+                    # Apply de-identification (replace face with 10th percentile intensity)
+                    fill_value = np.percentile(data, 10)
+                    defaced_data = np.where(full_mask == 1, fill_value, data)
+                    
+                    # Save Final Results
+                    nib.save(nib.Nifti1Image(full_mask, orig_img.affine), str(output_root / f"{case_id}_mask.nii.gz"))
+                    nib.save(nib.Nifti1Image(defaced_data, orig_img.affine), str(output_root / f"{case_id}_defaced.nii.gz"))
+                    
+                    logging.info(f"[GPU {device_id}] Completed: {case_id}")
+                    break 
+                else:
+                    raise RuntimeError(f"Inference failed to generate output. Info: {msg[-200:]}")
+
+            except Exception as e:
+                logging.error(f"[GPU {device_id}] Error on {case_id}: {e}")
+                if attempt < max_retries:
+                    time.sleep(3)
+            finally:
+                for path in [temp_input, temp_output]:
+                    if path.exists(): shutil.rmtree(path)
+
+def main():
+    parser = argparse.ArgumentParser(description="High-throughput Whole-body Defacing Pipeline")
+    parser.add_argument("-i", "--input", type=str, required=True, help="Folder containing *_0000.nii.gz files")
+    parser.add_argument("-o", "--output", type=str, required=True, help="Output folder for masks and defaced images")
+    parser.add_argument("-z", "--crop_z", type=int, default=110, help="Number of top slices to keep in Z-axis")
+    parser.add_argument("-m", "--margin", type=int, default=50, help="XY-axis margin for cropping")
+    parser.add_argument("-g", "--gpus", type=str, default="0", help="Comma-separated GPU IDs (e.g., 0,1)")
+    parser.add_argument("-w", "--workers_per_gpu", type=int, default=2, help="Parallel workers per GPU")
+    args = parser.parse_args()
+
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Filter files that haven't been processed yet
+    all_files = sorted([input_path / f for f in os.listdir(input_path) if f.endswith('_0000.nii.gz')])
+    todo_files = [f for f in all_files if not (output_path / f.name.replace('_0000.nii.gz', '_defaced.nii.gz')).exists()]
+
+    print(f"{'='*50}\nDefacing Pipeline | Todo: {len(todo_files)}\nGPUs: {args.gpus} | Workers/GPU: {args.workers_per_gpu}\n{'='*50}")
+
+    queue = Queue()
+    for f in todo_files:
+        queue.put(f)
+
+    gpu_list = [g.strip() for g in args.gpus.split(',')]
+    processes = []
+    
+    for device_id in gpu_list:
+        for w_id in range(args.workers_per_gpu):
+            p = Process(
+                target=worker_process, 
+                args=(queue, output_path, args.crop_z, device_id, w_id, args.margin)
+            )
+            p.start()
+            processes.append(p)
+
+    for p in processes:
+        p.join()
+
+    print("\nAll tasks completed successfully.")
+
+if __name__ == "__main__":
+    main()
