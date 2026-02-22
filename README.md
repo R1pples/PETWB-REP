@@ -9,7 +9,7 @@ Preprocessing steps include:
 ## To get started
 ```bash
 git clone https://github.com/R1pples/PETWB-REP.git
-cd ./PETWB-
+cd ./PETWB-REP
 ```
 ## Anonymization
 Patient identifiers and sensitive metadata were removed using the [RSNA DICOM Anonymizer (V18.0)](https://github.com/RSNA/Anonymizer) to remove the identifiers. The process follows standard de-identification protocols to ensure data privacy and compliance with ethical guidelines.
